@@ -112,5 +112,5 @@ public class DubboNamespaceHandler extends NamespaceHandlerSupport {
 }
 ```
 
-* 进入registerBeanDefinitionParser这个类继续查看，
+* 进入registerBeanDefinitionParser这个类继续查看， 
 
