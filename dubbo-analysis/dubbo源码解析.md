@@ -612,3 +612,271 @@ public class DubboNamespaceHandler extends NamespaceHandlerSupport {
     private static ManagedMap parseParameters(NodeList nodeList, RootBeanDefinition beanDefinition)
 ```
 
+### Bean的初始化
+
+​	这里我们通过ServiceBean来分析一下bean的初始化过程。由上文可知，service标签解析出来的BeanDefinition时单例非懒加载的，该BeanDefinition会在容器启动时直接初始化，下面我们来分析一下ServiceBean这个Bean的初始化过程。
+
+* 先找到dubbo-config-spring下的ServiceBean，这里包含6个主要的方法，这些方法来自于它实现的接口，我们这里提一嘴这些接口。
+   * InitializingBean 		--afterPropertiesSet方法  spring会在对象实例化之后调用该方法  一般用于初始化一些属性
+   * DisposableBean  		--destroy方法，spring容器关闭时调用，在销毁单例时由 BeanFactory 调用。
+   * ApplicationContextAware	--setApplicationContext方法  会传入一个ApplicationContext的实例。如果对象需要访问文件资源，即想要调用getResource ，想要发布应用程序事件，或者需要访问 MessageSource，也可以实现此接口。
+
+   * ApplicationListener		--onApplicationEvent方法 添加了上下文刷新的一个监听事件
+   * BeanNameAware			--setBeanName方法  设置BeanName，在创建此 bean 的 bean 工厂中设置 bean 的名称。
+
+```java
+public class ServiceBean<T> extends ServiceConfig<T> implements InitializingBean, DisposableBean, ApplicationContextAware, ApplicationListener<ContextRefreshedEvent>, BeanNameAware {
+...实现了6个主要方法
+}
+```
+
+继承关系如下图所示：
+
+![image-20211112110113500](dubbo源码解析/image-20211112110113500.png)
+
+ 其中实现的接口有几个涉及到spring Bean的生命周期接口，这里我们分析一下具体的方法内容。
+
+（查看一个关系图的具体接口，右键点击这个接口，然后jump to source即可）
+
+#### Aware接口实现
+
+* BeanNameAware的setBeanName方法实现：
+  * 接口介绍：由想要在 bean 工厂中知道其 bean 名称的 bean 实现的接口。 请注意，通常不建议对象依赖于它的 bean 名称，因为这表示对外部配置的潜在脆弱依赖，以及对 Spring API 的可能不必要的依赖。
+
+```java
+//由想要在 bean 工厂中知道其 bean 名称的 bean 实现的接口。
+//请注意，通常不建议对象依赖于它的 bean 名称，因为这表示对外部配置的潜在脆弱依赖，以及对 Spring API 的可能不必要的依赖
+    @Override
+    public void setBeanName(String name) {
+        this.beanName = name;
+    }
+```
+
+* ApplicationContextAware的setApplicationContext方法实现：
+  * SpringExtensionFactory的作用在于dubbo的SPI机制中的依赖注入，当有扩展类需要注入其他bean的时候，可能会从SpringExtensionFactory这个类中通过applicationContext获取Bean对象。
+
+```java
+//当一个对象需要访问一组协作 bean 时，实现这个接口是有意义的。 请注意，通过 bean 引用进行配置比仅出于 bean 查找目的实现此接口更可取。
+//如果对象需要访问文件资源，即想要调用getResource ，想要发布应用程序事件，或者需要访问 MessageSource，也可以实现此接口
+    @Override
+    public void setApplicationContext(ApplicationContext applicationContext) {
+        this.applicationContext = applicationContext;
+        //将applicationContext设置到SpringExtensionFactory中,用于后续从SpringExtensionFactory中获取Bean
+        //SpringExtensionFactory是dubbo自定义的一个类
+        SpringExtensionFactory.addApplicationContext(applicationContext);
+        if (applicationContext != null) {
+            SPRING_CONTEXT = applicationContext;
+            try {
+                Method method = applicationContext.getClass().getMethod("addApplicationListener", new Class<?>[]{ApplicationListener.class}); // backward compatibility to spring 2.0.1
+                method.invoke(applicationContext, new Object[]{this});
+                supportedApplicationListener = true;
+            } catch (Throwable t) {
+                if (applicationContext instanceof AbstractApplicationContext) {
+                    try {
+                        Method method = AbstractApplicationContext.class.getDeclaredMethod("addListener", new Class<?>[]{ApplicationListener.class}); // backward compatibility to spring 2.0.1
+                        if (!method.isAccessible()) {
+                            method.setAccessible(true);
+                        }
+                        method.invoke(applicationContext, new Object[]{this});
+                        supportedApplicationListener = true;
+                    } catch (Throwable t2) {
+                    }
+                }
+            }
+        }
+    }
+```
+
+* InitializingBean的afterPropertiesSet方法实现：
+  * 接口介绍：例如，当一个对象需要访问一组协作 bean 时，实现这个接口是有意义的。 请注意，通过 bean 引用进行配置比仅出于 bean 查找目的实现此接口更可取。
+    如果对象需要访问文件资源，即想要调用getResource ，想要发布应用程序事件，或者需要访问 MessageSource，也可以实现此接口。
+
+```java
+    @Override
+    @SuppressWarnings({ "deprecation"})
+    public void afterPropertiesSet() throws Exception {
+    	//如果当前ServiceBan的provider为空
+    	if (getProvider() == null) {
+            Map<String, ProviderConfig> providerConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ProviderConfig.class, false, false);
+            if (providerConfigMap != null && providerConfigMap.size() > 0) {
+                Map<String, ProtocolConfig> protocolConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ProtocolConfig.class, false, false);
+                if ((protocolConfigMap == null || protocolConfigMap.size() == 0)
+                        && providerConfigMap.size() > 1) { // backward compatibility
+                    List<ProviderConfig> providerConfigs = new ArrayList<ProviderConfig>();
+                    for (ProviderConfig config : providerConfigMap.values()) {
+                        if (config.isDefault() != null && config.isDefault().booleanValue()) {
+                            providerConfigs.add(config);
+                        }
+                    }
+                    if (!providerConfigs.isEmpty()) {
+                        setProviders(providerConfigs);
+                    }
+                } else {
+                    ProviderConfig providerConfig = null;
+                    for (ProviderConfig config : providerConfigMap.values()) {
+                        if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                            if (providerConfig != null) {
+                                throw new IllegalStateException("Duplicate provider configs: " + providerConfig + " and " + config);
+                            }
+                            providerConfig = config;
+                        }
+                    }
+                    if (providerConfig != null) {
+                        setProvider(providerConfig);
+                    }
+                }
+            }
+        }
+        
+        //如果当前ServiceBan的application为空，则为该Service设置application
+        if (getApplication() == null
+                && (getProvider() == null || getProvider().getApplication() == null)) {
+            Map<String, ApplicationConfig> applicationConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ApplicationConfig.class, false, false);
+            if (applicationConfigMap != null && applicationConfigMap.size() > 0) {
+                ApplicationConfig applicationConfig = null;
+                for (ApplicationConfig config : applicationConfigMap.values()) {
+                    if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                        if (applicationConfig != null) {
+                            throw new IllegalStateException("Duplicate application configs: " + applicationConfig + " and " + config);
+                        }
+                        applicationConfig = config;
+                    }
+                }
+                if (applicationConfig != null) {
+                    setApplication(applicationConfig);
+                }
+            }
+        }
+        //如果当前ServiceBan的module为空，则为该Service设置module
+        if (getModule() == null
+                && (getProvider() == null || getProvider().getModule() == null)) {
+            Map<String, ModuleConfig> moduleConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ModuleConfig.class, false, false);
+            if (moduleConfigMap != null && moduleConfigMap.size() > 0) {
+                ModuleConfig moduleConfig = null;
+                for (ModuleConfig config : moduleConfigMap.values()) {
+                    if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                        if (moduleConfig != null) {
+                            throw new IllegalStateException("Duplicate module configs: " + moduleConfig + " and " + config);
+                        }
+                        moduleConfig = config;
+                    }
+                }
+                if (moduleConfig != null) {
+                    setModule(moduleConfig);
+                }
+            }
+        }
+        //如果当前ServiceBan的Registries为空，则为该Service设置Registries
+        if ((getRegistries() == null || getRegistries().isEmpty())
+                && (getProvider() == null || getProvider().getRegistries() == null || getProvider().getRegistries().isEmpty())
+                && (getApplication() == null || getApplication().getRegistries() == null || getApplication().getRegistries().isEmpty())) {
+            Map<String, RegistryConfig> registryConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, RegistryConfig.class, false, false);
+            if (registryConfigMap != null && registryConfigMap.size() > 0) {
+                List<RegistryConfig> registryConfigs = new ArrayList<RegistryConfig>();
+                for (RegistryConfig config : registryConfigMap.values()) {
+                    if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                        registryConfigs.add(config);
+                    }
+                }
+                if (registryConfigs != null && !registryConfigs.isEmpty()) {
+                    super.setRegistries(registryConfigs);
+                }
+            }
+        }
+        //如果当前ServiceBan的Monitor为空，则为该Service设置Monitor
+        if (getMonitor() == null
+                && (getProvider() == null || getProvider().getMonitor() == null)
+                && (getApplication() == null || getApplication().getMonitor() == null)) {
+            Map<String, MonitorConfig> monitorConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, MonitorConfig.class, false, false);
+            if (monitorConfigMap != null && monitorConfigMap.size() > 0) {
+                MonitorConfig monitorConfig = null;
+                for (MonitorConfig config : monitorConfigMap.values()) {
+                    if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                        if (monitorConfig != null) {
+                            throw new IllegalStateException("Duplicate monitor configs: " + monitorConfig + " and " + config);
+                        }
+                        monitorConfig = config;
+                    }
+                }
+                if (monitorConfig != null) {
+                    setMonitor(monitorConfig);
+                }
+            }
+        }
+        //如果当前ServiceBan的Protocol为空，则为该Service设置Protocol
+        if ((getProtocols() == null || getProtocols().isEmpty())
+                && (getProvider() == null || getProvider().getProtocols() == null || getProvider().getProtocols().isEmpty())) {
+            Map<String, ProtocolConfig> protocolConfigMap = applicationContext == null ? null : BeanFactoryUtils.beansOfTypeIncludingAncestors(applicationContext, ProtocolConfig.class, false, false);
+            if (protocolConfigMap != null && protocolConfigMap.size() > 0) {
+                List<ProtocolConfig> protocolConfigs = new ArrayList<ProtocolConfig>();
+                for (ProtocolConfig config : protocolConfigMap.values()) {
+                    if (config.isDefault() == null || config.isDefault().booleanValue()) {
+                        protocolConfigs.add(config);
+                    }
+                }
+                if (protocolConfigs != null && !protocolConfigs.isEmpty()) {
+                    super.setProtocols(protocolConfigs);
+                }
+            }
+        }
+        // 设置服务名称
+        if (getPath() == null || getPath().length() == 0) {
+            if (beanName != null && beanName.length() > 0
+                    && getInterface() != null && getInterface().length() > 0
+                    && beanName.startsWith(getInterface())) {
+                setPath(beanName);
+            }
+        }
+        if (!isDelay()) {	//若非延迟加载
+            export();	//服务暴露
+        }
+    }
+```
+
+* ApplicationListener的onApplicationEvent方法实现：
+  * 接口介绍：应用程序事件侦听器要实现的接口。
+
+```java
+    @Override
+    public void onApplicationEvent(ContextRefreshedEvent event) {
+    	// 服务没有延迟加载 && 服务没有发布 && 服务没有下线过 。 满足这三个条件，则进行服务暴露
+        if (isDelay() && !isExported() && !isUnexported()) {
+            if (logger.isInfoEnabled()) {
+                logger.info("The service ready on spring started. service: " + getInterface());
+            }
+            export();	//进行服务暴露
+        }
+    }
+ 
+    private boolean isDelay() {
+    	// 获取延迟加载的设置 ， 延迟注册服务时间(毫秒)- ，设为-1时，表示延迟到Spring容器初始化完成时暴露服务
+        Integer delay = getDelay();
+        ProviderConfig provider = getProvider();
+        if (delay == null && provider != null) {
+            delay = provider.getDelay();
+        }
+        // 加入上下文刷新监听，并且没有设置延迟加载，
+        return supportedApplicationListener && (delay == null || delay == -1);
+    }
+```
+
+* DisposableBean的destroy方法:
+  * 接口介绍：由想要在销毁时释放资源的 bean 实现的接口。 如果 BeanFactory 处理缓存的单例，它应该调用 destroy 方法。 应用程序上下文应该在关闭时处理其所有单例。
+
+```java
+    @Override
+    public void destroy() throws Exception {
+        // no need to call unexport() here, see
+        // org.apache.dubbo.config.spring.extension.SpringExtensionFactory.ShutdownHookListener
+    }
+```
+
+整个初始化过程：
+
+> InitializingBean（*afterPropertiesSet*进行初始化)
+> --->BeanNameAware(*setBeanName*设置 bean 的名称)
+> --->ApplicationContextAware（ApplicationContextAware用将用于初始化对象）
+> --->ApplicationListener(onApplicationEvent应用程序事件侦听器要实现的接口)
+> --->DisposableBean(destroy在销毁单例时由 BeanFactory 调用)
+
+至此，bean的初始化过程就结束了。从上面的代码可以看出，Dubbo服务暴露是在afterPropertiesSet或onApplicationEvent两个方法中完成的，具体实现就是export方法，下面就涉及到《服务暴露》了，我先去学rocket mq了，下次再说。
