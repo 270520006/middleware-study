@@ -880,3 +880,389 @@ public class ServiceBean<T> extends ServiceConfig<T> implements InitializingBean
 > --->DisposableBean(destroy在销毁单例时由 BeanFactory 调用)
 
 至此，bean的初始化过程就结束了。从上面的代码可以看出，Dubbo服务暴露是在afterPropertiesSet或onApplicationEvent两个方法中完成的，具体实现就是export方法，下面就涉及到《服务暴露》了，我先去学rocket mq了，下次再说。
+
+### 服务暴露
+
+#### 检查配置
+
+​	由上篇的代码我们已经找到了服务暴露的方法export，下面我们来讲述一下dubbo服务暴露的过程。找到上次代码，然后鼠标滑轮点击或者ctrl+左键进入export方法：
+
+* 先找到上次使用了export的方法：
+  * isDelay()：判断是否延迟
+  * isExported()：判断是否导出过
+  * isUnexported()：判断是否被取消导出过
+
+```java
+public void onApplicationEvent(ContextRefreshedEvent event) {
+    // 是否有延迟导出 && 是否已导出 && 是不是已被取消导出
+    if (isDelay() && !isExported() && !isUnexported()) {
+        if (logger.isInfoEnabled()) {
+            logger.info("The service ready on spring started. service: " + getInterface());
+        }
+        //导出服务
+        export();
+    }
+}
+```
+
+* 进入export方法
+
+  * export：判断是否暴露，可以在标签中设置
+
+  ><dubbo:provider export="false" />
+
+  * delay：直接赋值要延时开始的时间，单位是秒
+
+```java
+    public synchronized void export() {
+        if (provider != null) { //服务提供者不为空
+            if (export == null) { //获取导入判断，如果为空。则重新获取
+                export = provider.getExport();
+            }
+            if (delay == null) {//获取延时判断，如果为空。则重新获取
+                delay = provider.getDelay();
+            }
+        }
+        if (export != null && !export) {
+            // 如果 export 为 false，则不导出服务
+            return;
+        }
+            //如果延迟判断不为空，且延迟时间大于0
+        if (delay != null && delay > 0) {
+            //使用单线程预定执行器，在延迟一定时间后执行任务，
+            delayExportExecutor.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    doExport();
+                }
+            }, delay, TimeUnit.MILLISECONDS);
+        } else {
+            //立刻导出服务
+            doExport();
+        }
+    }
+```
+
+* export方法中，最后又使用doExport方法，这里我们继续跟进：
+
+```java
+    protected synchronized void doExport() {
+        if (unexported) {//如果是已经取消暴露的，则抛出异常
+            throw new IllegalStateException("Already unexported!");
+        }
+        if (exported) {//如果是已经暴露过的，则直接返回
+            return;
+        }
+        exported = true;//因为我们要开始暴露了，所以先把已暴露打上true，防止多次跑到这个过程
+        // 检测 interfaceName 是否为空，为空则抛出异常
+        if (interfaceName == null || interfaceName.length() == 0) {
+            throw new IllegalStateException("<dubbo:service interface=\"\" /> interface not allow null!");
+        }
+        checkDefault();//检测 provider 是否为空，为空则新建一个，并通过系统变量为其初始化
+        // 下面几个 if 语句用于检测 provider、application 等核心配置类对象是否为空，
+        // 若为空，则尝试从其他配置类对象中获取相应的实例。
+        if (provider != null) { //经过了上面的方法，这里是必进入的
+            // 下面几个 if 语句用于检测 provider、application 等核心配置类对象是否为空，
+            // 若为空，则尝试从其他配置类对象中获取相应的实例。
+            if (application == null) {
+                application = provider.getApplication();
+            }
+            if (module == null) {//模块配置
+                module = provider.getModule();
+            }
+            if (registries == null) { //注册表
+                registries = provider.getRegistries();
+            }
+            if (monitor == null) {//监控配置
+                monitor = provider.getMonitor();
+            }
+            if (protocols == null) { //协议配置
+                protocols = provider.getProtocols();
+            }
+        }
+        if (module != null) {//模块配置不为空
+            if (registries == null) {//从模块中获取注册表
+                registries = module.getRegistries();
+            }
+            if (monitor == null) {//监控配置
+                monitor = module.getMonitor();
+            }
+        }
+        if (application != null) { //判断应用配置是否为空
+            if (registries == null) {//从应用配置读取注册表
+                registries = application.getRegistries();
+            }
+            if (monitor == null) {//从应用配置中获取监控配置
+                monitor = application.getMonitor();
+            }
+        }
+        //检测ref是否为泛化服务类型
+        if (ref instanceof GenericService) {
+            //是的话，则把接口的class类型设置成泛化类型
+            interfaceClass = GenericService.class;
+            if (StringUtils.isEmpty(generic)) {
+                //表明使用了泛化
+                generic = Boolean.TRUE.toString();
+            }
+        } else {// ref 非 GenericService 类型
+            try {
+                //使用Class.forName获取对象类型
+                interfaceClass = Class.forName(interfaceName, true, Thread.currentThread()
+                        .getContextClassLoader());
+            } catch (ClassNotFoundException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+            //对 interfaceClass，以及 <dubbo:method> 标签中的必要字段进行检查
+            checkInterfaceAndMethods(interfaceClass, methods);
+            //检测ref不为空 且 必须是interfaceClass的子类或者同类
+            checkRef();
+            //说明不是泛化类型
+            generic = Boolean.FALSE.toString();
+        }
+            //local 和 stub 在功能应该是一致的，用于配置本地存根
+            //local:服务接口的本地实现类名
+            //stub:服务接口的本地存根类名
+        if (local != null) {
+            if ("true".equals(local)) {
+                local = interfaceName + "Local";
+            }
+            Class<?> localClass;
+            try {
+                // 获取本地存根类（提供给定名称对应的类，即local对应的类）
+                localClass = ClassHelper.forNameWithThreadContextClassLoader(local);
+            } catch (ClassNotFoundException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+            // 检测本地存根类是否可赋值给接口类，若不可赋值则会抛出异常，提醒使用者本地存根类类型不合法
+            if (!interfaceClass.isAssignableFrom(localClass)) {
+                throw new IllegalStateException("The local implementation class " + localClass.getName() + " not implement interface " + interfaceName);
+            }
+        }
+        if (stub != null) { //这里和上面的local一样，都是本地存根
+            if ("true".equals(stub)) {
+                stub = interfaceName + "Stub";
+            }
+            Class<?> stubClass;
+            try {
+                // 获取本地存根类（提供给定名称对应的类，即local对应的类）
+                stubClass = ClassHelper.forNameWithThreadContextClassLoader(stub);
+            } catch (ClassNotFoundException e) {
+                throw new IllegalStateException(e.getMessage(), e);
+            }
+            // 检测本地存根类是否可赋值给接口类，若不可赋值则会抛出异常，提醒使用者本地存根类类型不合法
+            //这里有个点不是很懂，本地存根为什么要建立两个，而且方法一致。
+            if (!interfaceClass.isAssignableFrom(stubClass)) {
+                throw new IllegalStateException("The stub implementation class " + stubClass.getName() + " not implement interface " + interfaceName);
+            }
+        }
+        checkApplication(); //检查应用配置，没有就获取，还没有就抛异常
+        checkRegistry(); //检查配置表，没有就获取，还没有就抛异常
+        //协议为空，服务提供者不为空则设置服务提供者的协议。
+        //如果都为空，则设置默认协议，dubbo协议！！！
+        checkProtocol();
+        //添加进配置，配置为空则返回
+        appendProperties(this);
+        //校验sub local 和mock、
+        //local:服务接口的本地实现类名
+        //stub:服务接口的本地存根类名
+        checkStubAndMock(interfaceClass);
+        //如果服务名不存在，则使用接口名字
+        if (path == null || path.length() == 0) {
+            path = interfaceName;
+        }
+        // 导出服务
+        doExportUrls();
+        // ProviderModel 表示服务提供者模型，此对象中存储了与服务提供者相关的信息。
+        // 比如服务的配置信息，服务实例等。每个被导出的服务对应一个 ProviderModel。
+        // ApplicationModel 持有所有的 ProviderModel。
+        ProviderModel providerModel = new ProviderModel(getUniqueServiceName(), this, ref);
+        ApplicationModel.initProviderModel(getUniqueServiceName(), providerModel);
+    }
+```
+
+总结：上面过程有点多，这里总结一下。
+
+>1. 检测 <dubbo:service> 标签的 interface 属性合法性，不合法则抛出异常
+>2. 检测 ProviderConfig、ApplicationConfig 等核心配置类对象是否为空，若为空，则尝试从其他配置类对象中获取相应的实例。
+>3. 检测并处理泛化服务和普通服务类
+>4. 检测本地存根配置，并进行相应的处理
+>5. 对 ApplicationConfig、RegistryConfig 等配置类进行检测，为空则尝试创建，若无法创建则抛出异常
+
+​	配置检查并非本文重点，因此这里不打算对 doExport 方法所调用的方法进行分析（doExportUrls 方法除外）。在这些方法中，除了 appendProperties 方法稍微复杂一些，其他方法逻辑不是很复杂。因此，大家可自行分析。
+
+#### 多协议多注册中心导出服务
+
+* 上面的最后，调用了doExportUrls方法导出服务，我们跟进在看一下：
+  * Dubbo 允许我们使用不同的协议导出服务，也允许我们向多个注册中心注册服务。Dubbo 在 doExportUrls 方法中对多协议，多注册中心进行了支持。相关代码如下，我们重点关注两点：
+    * loadRegistries：加载注册中心链接
+    * doExportUrlsFor1Protocol：组装 URL
+
+```java
+    private void doExportUrls() {
+        //加载注册中心链接，就是你要引用的那个接口网址 /user/selectOne
+        List<URL> registryURLs = loadRegistries(true);
+        //遍历协议，并在每个协议下导出服务
+        for (ProtocolConfig protocolConfig : protocols) {
+            doExportUrlsFor1Protocol(protocolConfig, registryURLs);
+        }
+    }
+```
+
+​	上面代码首先是通过 loadRegistries 加载注册中心链接，然后再遍历 ProtocolConfig 集合导出每个服务。并在导出服务的过程中，将服务注册到注册中心。下面，我们先来看一下 loadRegistries 方法的逻辑。
+
+```java
+protected List<URL> loadRegistries(boolean provider) {
+    // 检测是否存在注册中心配置类，不存在则抛出异常
+    checkRegistry();
+    List<URL> registryList = new ArrayList<URL>();
+    if (registries != null && !registries.isEmpty()) {
+        for (RegistryConfig config : registries) {
+            String address = config.getAddress();
+            if (address == null || address.length() == 0) {
+                // 若 address 为空，则将其设为 0.0.0.0
+                address = Constants.ANYHOST_VALUE;
+            }
+ 
+            // 从系统属性中加载注册中心地址
+            String sysaddress = System.getProperty("dubbo.registry.address");
+            if (sysaddress != null && sysaddress.length() > 0) {
+                address = sysaddress;
+            }
+            // 检测 address 是否合法
+            if (address.length() > 0 && !RegistryConfig.NO_AVAILABLE.equalsIgnoreCase(address)) {
+                Map<String, String> map = new HashMap<String, String>();
+                // 添加 ApplicationConfig 中的字段信息到 map 中
+                appendParameters(map, application);
+                // 添加 RegistryConfig 字段信息到 map 中
+                appendParameters(map, config);
+                
+                // 添加 path、pid，protocol 等信息到 map 中
+                map.put("path", RegistryService.class.getName());
+                map.put("dubbo", Version.getProtocolVersion());
+                map.put(Constants.TIMESTAMP_KEY, String.valueOf(System.currentTimeMillis()));
+                if (ConfigUtils.getPid() > 0) {
+                    map.put(Constants.PID_KEY, String.valueOf(ConfigUtils.getPid()));
+                }
+                if (!map.containsKey("protocol")) {
+                    if (ExtensionLoader.getExtensionLoader(RegistryFactory.class).hasExtension("remote")) {
+                        map.put("protocol", "remote");
+                    } else {
+                        map.put("protocol", "dubbo");
+                    }
+                }
+ 
+                // 解析得到 URL 列表，address 可能包含多个注册中心 ip，
+                // 因此解析得到的是一个 URL 列表
+                List<URL> urls = UrlUtils.parseURLs(address, map);
+                for (URL url : urls) {
+                    url = url.addParameter(Constants.REGISTRY_KEY, url.getProtocol());
+                    // 将 URL 协议头设置为 registry
+                    url = url.setProtocol(Constants.REGISTRY_PROTOCOL);
+                    // 通过判断条件，决定是否添加 url 到 registryList 中，条件如下：
+                    // (服务提供者 && register = true 或 null) 
+                    //    || (非服务提供者 && subscribe = true 或 null)
+                    if ((provider && url.getParameter(Constants.REGISTER_KEY, true))
+                            || (!provider && url.getParameter(Constants.SUBSCRIBE_KEY, true))) {
+                        registryList.add(url);
+                    }
+                }
+            }
+        }
+    }
+    return registryList;
+}
+```
+
+loadRegistries 方法主要包含如下的逻辑：
+
+>1. 检测是否存在注册中心配置类，不存在则抛出异常
+>2. 构建参数映射集合，也就是 map
+>3. 构建注册中心链接列表
+>4. 遍历链接列表，并根据条件决定是否将其添加到 registryList 中
+
+#### 组装 URL
+
+​	配置检查完毕后，紧接着要做的事情是根据配置，以及其他一些信息组装 URL。前面说过，URL 是 Dubbo 配置的载体，通过 URL 可让 Dubbo 的各种配置在各个模块之间传递。URL 之于 Dubbo，犹如水之于鱼，非常重要。大家在阅读 Dubbo 服务导出相关源码的过程中，要注意 URL 内容的变化。既然 URL 如此重要，那么下面我们来了解一下 URL 组装的过程。
+
+```java
+private void doExportUrlsFor1Protocol(ProtocolConfig protocolConfig, List<URL> registryURLs) {
+    String name = protocolConfig.getName();
+    // 如果协议名为空，或空串，则将协议名变量设置为 dubbo
+    if (name == null || name.length() == 0) {
+        name = "dubbo";
+    }
+ 
+    Map<String, String> map = new HashMap<String, String>();
+    // 添加 side、版本、时间戳以及进程号等信息到 map 中
+    map.put(Constants.SIDE_KEY, Constants.PROVIDER_SIDE);
+    map.put(Constants.DUBBO_VERSION_KEY, Version.getProtocolVersion());
+    map.put(Constants.TIMESTAMP_KEY, String.valueOf(System.currentTimeMillis()));
+    if (ConfigUtils.getPid() > 0) {
+        map.put(Constants.PID_KEY, String.valueOf(ConfigUtils.getPid()));
+    }
+ 
+    // 通过反射将对象的字段信息添加到 map 中
+    appendParameters(map, application);
+    appendParameters(map, module);
+    appendParameters(map, provider, Constants.DEFAULT_KEY);
+    appendParameters(map, protocolConfig);
+    appendParameters(map, this);
+ 
+    // methods 为 MethodConfig 集合，MethodConfig 中存储了 <dubbo:method> 标签的配置信息
+    if (methods != null && !methods.isEmpty()) {
+        // 这段代码用于添加 Callback 配置到 map 中，代码太长，待会单独分析
+    }
+ 
+    // 检测 generic 是否为 "true"，并根据检测结果向 map 中添加不同的信息
+    if (ProtocolUtils.isGeneric(generic)) {
+        map.put(Constants.GENERIC_KEY, generic);
+        map.put(Constants.METHODS_KEY, Constants.ANY_VALUE);
+    } else {
+        String revision = Version.getVersion(interfaceClass, version);
+        if (revision != null && revision.length() > 0) {
+            map.put("revision", revision);
+        }
+ 
+        // 为接口生成包裹类 Wrapper，Wrapper 中包含了接口的详细信息，比如接口方法名数组，字段信息等
+        String[] methods = Wrapper.getWrapper(interfaceClass).getMethodNames();
+        // 添加方法名到 map 中，如果包含多个方法名，则用逗号隔开，比如 method = init,destroy
+        if (methods.length == 0) {
+            logger.warn("NO method found in service interface ...");
+            map.put(Constants.METHODS_KEY, Constants.ANY_VALUE);
+        } else {
+            // 将逗号作为分隔符连接方法名，并将连接后的字符串放入 map 中
+            map.put(Constants.METHODS_KEY, StringUtils.join(new HashSet<String>(Arrays.asList(methods)), ","));
+        }
+    }
+ 
+    // 添加 token 到 map 中
+    if (!ConfigUtils.isEmpty(token)) {
+        if (ConfigUtils.isDefault(token)) {
+            // 随机生成 token
+            map.put(Constants.TOKEN_KEY, UUID.randomUUID().toString());
+        } else {
+            map.put(Constants.TOKEN_KEY, token);
+        }
+    }
+    // 判断协议名是否为 injvm
+    if (Constants.LOCAL_PROTOCOL.equals(protocolConfig.getName())) {
+        protocolConfig.setRegister(false);
+        map.put("notify", "false");
+    }
+ 
+    // 获取上下文路径
+    String contextPath = protocolConfig.getContextpath();
+    if ((contextPath == null || contextPath.length() == 0) && provider != null) {
+        contextPath = provider.getContextpath();
+    }
+ 
+    // 获取 host 和 port
+    String host = this.findConfigedHosts(protocolConfig, registryURLs, map);
+    Integer port = this.findConfigedPorts(protocolConfig, name, map);
+    // 组装 URL
+    URL url = new URL(name, host, port, (contextPath == null || contextPath.length() == 0 ? "" : contextPath + "/") + path, map);
+    
+    // 省略无关代码
+}
+```
+
