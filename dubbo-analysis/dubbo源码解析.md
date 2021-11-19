@@ -1207,9 +1207,10 @@ private void doExportUrlsFor1Protocol(ProtocolConfig protocolConfig, List<URL> r
     appendParameters(map, provider, Constants.DEFAULT_KEY);
     appendParameters(map, protocolConfig);
     appendParameters(map, this);
- 
-    // methods 为 MethodConfig 集合，MethodConfig 中存储了 <dubbo:method> 标签的配置信息
+  	// methods 为 MethodConfig 集合，MethodConfig 中存储了 <dubbo:method> 标签的配置信息
+    //这块先不分析，if和for各种嵌套，看着不像源码，像同事写的代码
     if (methods != null && !methods.isEmpty()) {
+        //......
         // 这段代码用于添加 Callback 配置到 map 中，代码太长，待会单独分析
     }
  
@@ -1261,8 +1262,93 @@ private void doExportUrlsFor1Protocol(ProtocolConfig protocolConfig, List<URL> r
     Integer port = this.findConfigedPorts(protocolConfig, name, map);
     // 组装 URL
     URL url = new URL(name, host, port, (contextPath == null || contextPath.length() == 0 ? "" : contextPath + "/") + path, map);
-    
     // 省略无关代码
 }
 ```
 
+​	上面的代码首先是将一些信息，比如版本、时间戳、方法名以及各种配置对象的字段信息放入到 map 中，map 中的内容将作为 URL 的查询字符串。构建好 map 后，紧接着是获取上下文路径、主机名以及端口号等信息。最后将 map 和主机名等数据传给 URL 构造方法创建 URL 对象。需要注意的是，这里出现的 URL 并非 java.net.URL，而是 com.alibaba.dubbo.common.URL。
+
+* 下面来分析一下，上面if和for互相嵌套的代码，这段代码用于检测 <dubbo:method> 标签中的配置信息，并将相关配置添加到 map 中：
+
+```java
+ if (methods != null && !methods.isEmpty()) {
+            for (MethodConfig method : methods) { //第一层嵌套
+                // 添加 MethodConfig 对象的字段信息到 map 中，键 = 方法名.属性名。
+                // 比如存储 <dubbo:method name="sayHello" retries="2"> 对应的 MethodConfig，
+                // 键 = sayHello.retries，map = {"sayHello.retries": 2, "xxx": "yyy"}
+                appendParameters(map, method, method.getName());
+                String retryKey = method.getName() + ".retry";
+                //概括：设置重试次数
+                if (map.containsKey(retryKey)) {
+                    String retryValue = map.remove(retryKey);
+                    // 检测 MethodConfig retry 是否为 false，若是，则设置重试次数为0
+                    if ("false".equals(retryValue)) {
+                        map.put(method.getName() + ".retries", "0");
+                    }
+                }
+                // 获取 ArgumentConfig 列表（argument是方法参数配置）
+                List<ArgumentConfig> arguments = method.getArguments();
+                if (arguments != null && !arguments.isEmpty()) {//第二层嵌套，保证argument不为空
+                    //遍历argument配置，里面配有类型，是否有返回（argument是方法参数配置）
+                    for (ArgumentConfig argument : arguments) {
+                        // 判断argument类型不为空且长度大于0，否则（argument是方法参数配置）
+                        if (argument.getType() != null && argument.getType().length() > 0) {//第三层嵌套
+                            Method[] methods = interfaceClass.getMethods();//获取接口的所有方法
+                            //如果方法不为空，则开始遍历方法
+                            if (methods != null && methods.length > 0) { //第四层嵌套
+                                for (int i = 0; i < methods.length; i++) {
+                                    String methodName = methods[i].getName();
+                                    // target the method, and get its signature
+                                    //对比方法名，开始寻找目标方法
+                                    if (methodName.equals(method.getName())) {//第五层嵌套
+                                        Class<?>[] argtypes = methods[i].getParameterTypes();//获取传入参数，如果没有数组则为0
+                                        // one callback in the method
+                                        if (argument.getIndex() != -1) {
+                                            //传入的参数和方法参数配置参数相同则添加进去
+                                            if (argtypes[argument.getIndex()].getName().equals(argument.getType())) {
+                                                // 添加 ArgumentConfig 字段信息到 map 中，
+                                                // 键前缀 = 方法名.index，比如:
+                                                // map = {"sayHello.3": true}
+                                                appendParameters(map, argument, method.getName() + "." + argument.getIndex());
+                                            } else {
+                                                //如果名称不一致则抛出异常
+                                                throw new IllegalArgumentException("argument config error : the index attribute and type attribute not match :index :" + argument.getIndex() + ", type:" + argument.getType());
+                                            }
+                                        } else {
+                                            //argument.getIndex() == -1表明没有设置
+                                            // multiple callbacks in the method
+                                            for (int j = 0; j < argtypes.length; j++) {
+                                                Class<?> argclazz = argtypes[j];
+                                                // 从参数类型列表中查找类型名称为 argument.type 的参数
+                                                if (argclazz.getName().equals(argument.getType())) {
+                                                    appendParameters(map, argument, method.getName() + "." + j);
+                                                    if (argument.getIndex() != -1 && argument.getIndex() != j) {
+                                                        throw new IllegalArgumentException("argument config error : the index attribute and type attribute not match :index :" + argument.getIndex() + ", type:" + argument.getType());
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }//第四层嵌套
+                                }
+                            }//第四层嵌套
+                        }//第三层嵌套
+                        //用户没有设置类型，但配置了index，所以index不为-1
+                        else if (argument.getIndex() != -1) {
+                            // 添加 ArgumentConfig 字段信息到 map 中
+                            appendParameters(map, argument, method.getName() + "." + argument.getIndex());
+                        } else {
+                            //抛出异常，用户没有设置参数类型也没设置index属性，抛出异常
+                            throw new IllegalArgumentException("argument config must set index or type attribute.eg: <dubbo:argument index='0' .../> or <dubbo:argument type=xxx .../>");
+                        }
+
+                    }
+                }//第二层嵌套
+            } // 第一层嵌套结束。end of methods for,
+        }
+```
+
+​	appendParameters 这个方法出现的次数比较多，该方法用于将对象字段信息添加到 map 中。实现上则是通过反射获取目标对象的 getter 方法，并调用该方法获取属性值。然后再通过 getter 方法名解析出属性名，比如从方法名 getName 中可解析出属性 name。如果用户传入了属性名前缀，此时需要将属性名加入前缀内容。最后将 <属性名，属性值> 键值对存入到 map 中就行了。限于篇幅原因，这里就不分析 appendParameters 方法的源码了，大家请自行分析。
+
+### 导出dubbo服务
+
+​	前置工作做完，接下来就可以进行服务导出了。服务导出分为导出到本地 (JVM)，和导出到远程。在深入分析服务导出的源码前，我们先来从宏观层面上看一下服务导出逻辑。如下：
