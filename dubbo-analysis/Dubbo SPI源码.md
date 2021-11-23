@@ -338,8 +338,10 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
     }
 ```
 
+总结：代码整体就是，缓存有对象从缓存获取对象。没对象，就用createExtension方法创建对象（在createExtension的过程中把对象放入缓存），最后返回得到的对象。
+
 * 进入createExtension方法中，该方法主要做了以下四件事：
-  * 先根据name来得到对应的扩展类。从ClassPath下`META-INF`文件夹下读取扩展点配置文件。
+  * 先根据name来得到对应的扩展类。从ClassPath下META-INF文件夹下读取扩展点配置文件。
   * 使用反射创建一个扩展类的实例
   * 对扩展类实例的属性进行依赖注入，即IOC。
   * 如果有wrapper，添加wrapper。即AOP。
@@ -366,7 +368,7 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
             injectExtension(instance);
             Set<Class<?>> wrapperClasses = cachedWrapperClasses;
             if (wrapperClasses != null && !wrapperClasses.isEmpty()) {
-                // 循环创建Wrapper实例
+                // 循环创建Wrapper实例。wrapper是什么？可以类比我先前写的案例，或者我后面细说
                 for (Class<?> wrapperClass : wrapperClasses) {
                 // 通过反射创建Wrapper实例
                 // 向Wrapper实例注入依赖，最后赋值给instance
@@ -384,7 +386,7 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
 
 ### SPI实现的四个过程
 
-#### 读取配置文件
+#### 读取配置文件加入缓存
 
 * 先根据name来得到对应的扩展类。从ClassPath下META-INF文件夹下读取扩展点配置文件。
 
@@ -392,7 +394,7 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
     private Map<String, Class<?>> getExtensionClasses() {
         //从缓存（助手类）里获取map
         Map<String, Class<?>> classes = cachedClasses.get();
-        //双检锁，仍旧没有注意重编排问题
+        //双检锁,如果map不存在则去配置文件里加载
         if (classes == null) {
             synchronized (cachedClasses) {
                 classes = cachedClasses.get();
@@ -408,5 +410,233 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
     }
 ```
 
-* 
+* loadExtensionClasses的作用如下：
+  * 配置默认拓展名，校验默认拓展名为1个，否则异常
+  * 创建一个新的map，使用loadDirectory方法，把map和目录路径带入方法中使用
+
+```java
+    private Map<String, Class<?>> loadExtensionClasses() {
+        //获取SPI注解，检查合法性
+        //就是获取SPI的默认拓展名，然后判断默认拓展名是否为一个
+        // 是的话cachedDefaultName为这个值
+        final SPI defaultAnnotation = type.getAnnotation(SPI.class);
+        if (defaultAnnotation != null) { //如果该注解不为空
+            String value = defaultAnnotation.value();//从注解里获取值
+            if ((value = value.trim()).length() > 0) {//去掉前后空格，长度后大于0
+                String[] names = NAME_SEPARATOR.split(value);//使用注解值获取默认拓展名数组
+                if (names.length > 1) {//默认拓展名数组长度大于1，报错
+                    throw new IllegalStateException("more than 1 default extension name on extension " + type.getName()
+                            + ": " + Arrays.toString(names));
+                }
+                //默认拓展名为一个，就给cachedDefaultName赋值
+                if (names.length == 1) cachedDefaultName = names[0];
+            }
+        }
+        //创建一个map用来存放要创建实体类的目录
+        Map<String, Class<?>> extensionClasses = new HashMap<String, Class<?>>();
+        //META-INF/dubbo/internal
+        loadDirectory(extensionClasses, DUBBO_INTERNAL_DIRECTORY);
+        //META-INF/dubbo/
+        loadDirectory(extensionClasses, DUBBO_DIRECTORY);
+        //META-INF/services/
+        loadDirectory(extensionClasses, SERVICES_DIRECTORY);
+        //返回存储实体类目录的map
+        return extensionClasses;
+    }
+```
+
+* 进入loadDirectory方法中：
+  * 拼串，把urls设置成枚举，一个个提取url，放入loadResource方法中
+
+```java
+private void loadDirectory(Map<String, Class<?>> extensionClasses, String dir) {
+    //把传进来的目录进行拼串，例如META-INF/dubbo/com.zsp.Robot
+    String fileName = dir + type.getName();
+    try {
+        //定义一个枚举
+        Enumeration<java.net.URL> urls;
+        //获取类加载器
+        ClassLoader classLoader = findClassLoader();
+        if (classLoader != null) {//如果类加载器不为空
+            //根据目录获取资源的urls
+            urls = classLoader.getResources(fileName);
+        } else {
+            //用于加载类的搜索路径中查找指定名称的所有资源
+            urls = ClassLoader.getSystemResources(fileName);
+        }
+        if (urls != null) { //如果urls不为空
+            while (urls.hasMoreElements()) {//遍历urls查看是否还含有元素
+                java.net.URL resourceURL = urls.nextElement(); //从urls中取值
+                //使用loadResource进行接口实体化
+                loadResource(extensionClasses, classLoader, resourceURL);
+            }
+        }
+    } catch (Throwable t) {
+        logger.error("Exception when load extension class(interface: " +
+                type + ", description file: " + fileName + ").", t);
+    }
+}
+```
+
+* 使用流读取配置文件，截取实现类路径，使用loadClass加载类：
+
+```java
+    private void loadResource(Map<String, Class<?>> extensionClasses, ClassLoader classLoader, java.net.URL resourceURL) {
+        try {
+            //这里和Java SPI有点类似，创建流读取
+            BufferedReader reader = new BufferedReader(new InputStreamReader(resourceURL.openStream(), "utf-8"));
+            try {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    final int ci = line.indexOf('#'); //获取#的索引
+                    if (ci >= 0) line = line.substring(0, ci);//截取#后的所有消息
+                    line = line.trim();//去除头尾空格
+                    if (line.length() > 0) {//如果长度还大于0
+                        try {
+                            String name = null;
+                            int i = line.indexOf('=');//“=”的索引位置
+                            if (i > 0) {//如果有"="，则进行截串
+                                //获取名字，获取实体类位置
+                                //例如：bumblebee = com.zsp.Bumblebee
+                                name = line.substring(0, i).trim();
+                                line = line.substring(i + 1).trim();
+                            }
+                            if (line.length() > 0) {//如果实现类字段不为空
+                                loadClass(extensionClasses, resourceURL, Class.forName(line, true, classLoader), name);
+                            }
+                        } catch (Throwable t) {
+                            IllegalStateException e = new IllegalStateException("Failed to load extension class(interface: " + type + ", class line: " + line + ") in " + resourceURL + ", cause: " + t.getMessage(), t);
+                            exceptions.put(line, e);
+                        }
+                    }
+                }
+            } finally {
+                reader.close();
+            }
+        } catch (Throwable t) {
+            logger.error("Exception when load extension class(interface: " +
+                    type + ", class file: " + resourceURL + ") in " + resourceURL, t);
+        }
+    }
+
+```
+
+* 进入loadResource查看，解释一下传参：
+  * extensionClasses：用于存储类名和类
+  * classLoader：类加载器
+  * resourceURL：读取路径
+
+```java
+    private void loadResource(Map<String, Class<?>> extensionClasses, ClassLoader classLoader, java.net.URL resourceURL) {
+        try {
+            //这里和Java SPI有点类似，创建流读取
+            BufferedReader reader = new BufferedReader(new InputStreamReader(resourceURL.openStream(), "utf-8"));
+            try {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    final int ci = line.indexOf('#'); //获取#的索引
+                    if (ci >= 0) line = line.substring(0, ci);//截取#后的所有消息
+                    line = line.trim();//去除头尾空格
+                    if (line.length() > 0) {//如果长度还大于0
+                        try {
+                            String name = null;
+                            int i = line.indexOf('=');//“=”的索引位置
+                            if (i > 0) {//如果有"="，则进行截串
+                                //获取名字，获取实体类位置
+                                //例如：bumblebee = com.zsp.Bumblebee
+                                name = line.substring(0, i).trim();
+                                line = line.substring(i + 1).trim();
+                            }
+                            if (line.length() > 0) {//如果实现类字段不为空
+                                //经过一系列校验，使用line加载指定目录的实体类
+                                loadClass(extensionClasses, resourceURL, Class.forName(line, true, classLoader), name);
+                            }
+                        } catch (Throwable t) {
+                            IllegalStateException e = new IllegalStateException("Failed to load extension class(interface: " + type + ", class line: " + line + ") in " + resourceURL + ", cause: " + t.getMessage(), t);
+                            exceptions.put(line, e);
+                        }
+                    }
+                }
+            } finally {
+                reader.close();
+            }
+        } catch (Throwable t) {
+            logger.error("Exception when load extension class(interface: " +
+                    type + ", class file: " + resourceURL + ") in " + resourceURL, t);
+        }
+    }
+
+```
+
+* 在进入loadClass查看一下类是这么加载的：
+  * 这里就是进行一连串判断（例如判断实体类有没有实现接口、是否有Adaptive注释），然后把类丢进缓存map里以供使用
+
+```java
+private void loadClass(Map<String, Class<?>> extensionClasses, java.net.URL resourceURL, Class<?> clazz, String name) throws NoSuchMethodException {
+    if (!type.isAssignableFrom(clazz)) { //判断type是否为lazz的父类或者实现的接口
+        throw new IllegalStateException("Error when load extension class(interface: " +
+                type + ", class line: " + clazz.getName() + "), class "
+                + clazz.getName() + "is not subtype of interface.");
+    }
+    if (clazz.isAnnotationPresent(Adaptive.class)) {//判断是否有Adaptive注释
+        if (cachedAdaptiveClass == null) {//如果注释为空
+            cachedAdaptiveClass = clazz; //则把当前类设置为缓存的自适应类
+        } else if (!cachedAdaptiveClass.equals(clazz)) { //如果二者不相等。报错
+            throw new IllegalStateException("More than 1 adaptive class found: "
+                    + cachedAdaptiveClass.getClass().getName()
+                    + ", " + clazz.getClass().getName());
+        }
+    } else if (isWrapperClass(clazz)) { //如果是wrapper包装增强类
+        Set<Class<?>> wrappers = cachedWrapperClasses;//从缓存中获取所有class的set序列
+        if (wrappers == null) {//如果包装序列为空
+            //创建新的concurrentSet
+            cachedWrapperClasses = new ConcurrentHashSet<Class<?>>();
+            //获取包装集合
+            wrappers = cachedWrapperClasses;
+        }
+       //将wrapper包装增强类添加进集合
+        wrappers.add(clazz);
+    } else {//没有Adaptive注解，也不是wrapper类
+        clazz.getConstructor();//确保有无参构造方法，没有就抛出异常
+        if (name == null || name.length() == 0) {//没有传入名字，例如：com.zsp.RobotWrapper
+            name = findAnnotationName(clazz);//获取类名称
+            if (name == null || name.length() == 0) {//如果为空则从类里获取名字
+                if (clazz.getSimpleName().length() > type.getSimpleName().length()
+                        && clazz.getSimpleName().endsWith(type.getSimpleName())) {
+                    name = clazz.getSimpleName().substring(0, clazz.getSimpleName().length() - type.getSimpleName().length()).toLowerCase();
+                } else {
+                    throw new IllegalStateException("No such extension name for the class " + clazz.getName() + " in the config " + resourceURL);
+                }
+            }
+        }
+        String[] names = NAME_SEPARATOR.split(name);//获取默认拓展名数组集合
+        if (names != null && names.length > 0) {//如果默认拓展名数组不为空
+            //获取类的Activate类型的注解
+            Activate activate = clazz.getAnnotation(Activate.class);
+            if (activate != null) {//如果该注解不为空，则向缓存的Activates注解map中放入默认拓展名
+                cachedActivates.put(names[0], activate);
+            }
+            for (String n : names) {//遍历名字
+                if (!cachedNames.containsKey(clazz)) {//如果缓存的类里不包含该类
+                    cachedNames.put(clazz, n);//则在缓存中放入该类
+                }
+                Class<?> c = extensionClasses.get(n);//使用类名获取对应的类
+                if (c == null) {//如果获取的类为空
+                    extensionClasses.put(n, clazz);//把名和类放入
+                } else if (c != clazz) {//如果c不为空，又不是类，则抛出异常
+                    throw new IllegalStateException("Duplicate extension " + type.getName() + " name " + n + " on " + c.getName() + " and " + clazz.getName());
+                }
+            }
+        }
+    }
+}
+```
+
+​	至此Dubbo SPI读取配置文件过程完成，整个过程就是使用流读取指定目录下的文件，生成实现接口的指定类，最后放入缓存中，以供后续使用。
+
+
+
+
+
+
 
