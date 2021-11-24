@@ -177,9 +177,7 @@ public class OptimusPrime implements Robot {
 * 配置类，我们把上面的RobotWrapper注释掉
 
 ```properties
-optimusPrime = com.zsp.OptimusPrime
-bumblebee = com.zsp.Bumblebee
-# com.zsp.RobotWrapper
+optimusPrime = com.zsp.OptimusPrimebumblebee = com.zsp.Bumblebee# com.zsp.RobotWrapper
 ```
 
 * 测试类
@@ -269,6 +267,7 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
   ```
 
 * 进入扩展点加载器的获取源码，迎面过来四个判断，看一下四个判断的意思：
+
   * 判断扩展点不能为空
   * 判断扩展点必须为接口
   * 扩展点必须有@SPI的注解
@@ -386,7 +385,52 @@ demo=my=com.zsp.dubbo.rpc.cluster.DemoLoadBalance
 
 ### SPI实现的四个过程
 
-#### 读取配置文件加入缓存
+​	这里解释下四个过程是哪四个过程：
+
+1、读取配置文件生成类加入缓存
+
+```java
+        Class<?> clazz = getExtensionClasses().get(name);
+```
+
+2、使用类作为键，从缓存中读取对象，没有则使用反射从该类上创建出对象
+
+```java
+			//尝试从concurrenthashmap中获取对象
+            T instance = (T) EXTENSION_INSTANCES.get(clazz);
+            if (instance == null) {//如果获取不到对象
+                //使用反射调用nesInstance来创建扩展类的一个实例
+                // 将获取到的扩展类和新创建的class传入concurrenthashmap中
+                EXTENSION_INSTANCES.putIfAbsent(clazz, clazz.newInstance());
+                //从插入的数据里再获取对象
+                instance = (T) EXTENSION_INSTANCES.get(clazz);
+```
+
+3、进行IOC注入
+
+```java
+            // 对扩展类示例进行依赖注入,即IOC(后面细说)
+            injectExtension(instance);
+```
+
+4、查看是否有增强类wrapper，如果存在则循环AOP过程，对类进行增强(就是在方法前后添加想要增加的方法)
+
+```java
+Set<Class<?>> wrapperClasses = cachedWrapperClasses;
+            if (wrapperClasses != null && !wrapperClasses.isEmpty()) {
+                // 循环获取Wrapper实例，wrapper类似于代理模式或者aop，会在输出语句前后执行事件
+                for (Class<?> wrapperClass : wrapperClasses) {
+                // 通过反射创建Wrapper实例
+                // 向Wrapper实例注入依赖，最后赋值给instance
+                // 自动包装实现类似aop功能
+                    instance = injectExtension((T) wrapperClass.getConstructor(type).newInstance(instance));
+                }
+            }
+```
+
+​	这四个过程执行完毕就返回对应的对象，下面来细说四个过程。
+
+#### 1、读取配置文件生成类加入缓存
 
 * 先根据name来得到对应的扩展类。从ClassPath下META-INF文件夹下读取扩展点配置文件。
 
@@ -634,9 +678,208 @@ private void loadClass(Map<String, Class<?>> extensionClasses, java.net.URL reso
 
 ​	至此Dubbo SPI读取配置文件过程完成，整个过程就是使用流读取指定目录下的文件，生成实现接口的指定类，最后放入缓存中，以供后续使用。
 
+#### 2、缓存读取，无实例就反射生成
+
+* 这个过程没什么可以深入的，都在标题上了，详细的看注释就行：
+
+```java
+		//尝试从concurrenthashmap中获取对象
+        T instance = (T) EXTENSION_INSTANCES.get(clazz);
+        if (instance == null) {//如果获取不到对象
+            //使用反射调用nesInstance来创建扩展类的一个实例
+            // 将获取到的扩展类和新创建的class传入concurrenthashmap中
+            EXTENSION_INSTANCES.putIfAbsent(clazz, clazz.newInstance());
+            //从插入的数据里再获取对象
+            instance = (T) EXTENSION_INSTANCES.get(clazz);
+```
+
+#### 3、进行IOC注入
+
+* 总流程中，injectExtension方法里的用在了两个地方。
+  * 刚从类获取得到的实体类，使用ioc注入
+  * 使用wrapper增强，使用ioc注入
+
+这里先讲第一个部分，第二个部分留到第四个过程讲，下面从injectExtension进入方法：
+
+```java
+            injectExtension(instance);
+
+			instance = injectExtension((T) wrapperClass.getConstructor(type).newInstance(instance));
+```
+
+* 进入injectExtension方法中：
+  * instance：传入的要ioc注入的对象
+
+```java
+    private T injectExtension(T instance) {
+        try {
+            //保证objectFactory工厂不为空（objectFactory先记住是个对象工厂，后面细说）
+            if (objectFactory != null) {
+                //使用反射得到对象的所有方法
+                for (Method method : instance.getClass().getMethods()) {
+                    //找寻是否存在 set开头&&只有一个参数&&并且是public级别的方法
+                    if (method.getName().startsWith("set")
+                            && method.getParameterTypes().length == 1
+                            && Modifier.isPublic(method.getModifiers())) {
+                        //获取方法传参类型
+                        Class<?> pt = method.getParameterTypes()[0];
+                        try {
+                            //获取属性名，比如setAge就变成age
+                            String property = method.getName().length() > 3 ? method.getName().substring(3, 4).toLowerCase() + method.getName().substring(4) : "";
+                            //重点，从objectFactory里拿出依赖对象
+                            Object object = objectFactory.getExtension(pt, property);
+                            if (object != null) {
+                                //使用反射进行注入，例如setAge（int age）,把age的值传入
+                                method.invoke(instance, object);
+                            }
+                        } catch (Exception e) {//异常报错即可
+                            logger.error("fail to inject via method " + method.getName()
+                                    + " of interface " + type.getName() + ": " + e.getMessage(), e);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            logger.error(e.getMessage(), e);
+        }
+        return instance;
+    }
+```
+
+在上面代码中，objectFactory 变量的类型为 AdaptiveExtensionFactory，AdaptiveExtensionFactory 内部维护了一个 ExtensionFactory 列表，用于存储其他类型的 ExtensionFactory。Dubbo 目前提供了两种 ExtensionFactory，分别是 SpiExtensionFactory 和 SpringExtensionFactory。前者用于创建自适应的拓展，后者是用于从 Spring 的 IOC 容器中获取所需的拓展。下面来讲一下这两个类：
+
+##### SpiExtensionFactory 
+
+>进入SpiExtensionFactory中，是不是非常熟悉，这个就是我们刚开始获取加载器的方法：
+>
+>```java
+>public class SpiExtensionFactory implements ExtensionFactory {
+>    @Override
+>    public <T> T getExtension(Class<T> type, String name) {
+>        //类型是接口&&并且有SPI的注解
+>        if (type.isInterface() && type.isAnnotationPresent(SPI.class)) {
+>            //获取扩展点加载器，这里的扩展点加载器源码前面讲过了
+>            ExtensionLoader<T> loader = ExtensionLoader.getExtensionLoader(type);
+>            //如果不为空，则使用getAdaptiveExtension方法得到注入实体
+>            if (!loader.getSupportedExtensions().isEmpty()) {
+>                return loader.getAdaptiveExtension();
+>            }
+>        }
+>        return null;
+>    }
+>}
+>```
+>
+>* 再进入getAdaptiveExtension查看
+>
+>```java
+>    @SuppressWarnings("unchecked")
+>    public T getAdaptiveExtension() {
+>        //先从缓存中获取
+>        Object instance = cachedAdaptiveInstance.get();
+>        if (instance == null) {//双检锁，如果缓存没有这个类
+>            if (createAdaptiveInstanceError == null) {//创建自适应扩展instance异常为空
+>                synchronized (cachedAdaptiveInstance) {
+>                    instance = cachedAdaptiveInstance.get();
+>                    if (instance == null) {
+>                        try {
+>                            //使用createAdaptiveExtension获得
+>                            //该方法调用了injectExtension
+>                            //所以不看了，又返回了第三个过程，总之就是得到了实体
+>                            instance = createAdaptiveExtension();
+>                            //塞进缓存
+>                            cachedAdaptiveInstance.set(instance);
+>                        } catch (Throwable t) {
+>                            createAdaptiveInstanceError = t; //提示异常
+>                            throw new IllegalStateException("fail to create adaptive instance: " + t.toString(), t);
+>                        }
+>                    }
+>                }
+>            } else { //抛出异常，无法创建实例
+>                throw new IllegalStateException("fail to create adaptive instance: " + createAdaptiveInstanceError.toString(), createAdaptiveInstanceError);
+>            }
+>        }
+>
+>        return (T) instance;
+>    }
+>```
+
+##### SpringExtensionFactory
+
+>* 这里就讲下dubbo调用的代码块就好，再细下去，我要把spring也讲完才能解释的清了。。。
+>
+>```java
+> public <T> T getExtension(Class<T> type, String name) {
+>        //遍历获取context，context就是一个提供了很多功能的工具类
+>        //其中一个功能就是可以访问spring的bean工厂
+>        for (ApplicationContext context : contexts) {
+>            //使用名字判断是否包含需要的实体类
+>            if (context.containsBean(name)) {
+>                //获取实体类
+>                Object bean = context.getBean(name);
+>                if (type.isInstance(bean)) { //判断这个实体是不是这个类实现的或者是子类等
+>                    return (T) bean;
+>                }
+>            }
+>        }
+>        return null;
+>    }
+>```
+
+​	好了，可以说非常细了，把所见到的所有的类，方法，做了什么，怎么实现都讲完了，这一块如果不明白可以多看看。
+
+至此IOC注入完成了，总结一下发生了什么：
+
+> * 使用反射获取所有方法
+> * 遍历方法获取："set"开头、只含一个入参、public的方法
+> * 获取传参类型、对方法名进行处理获取属性名
+> * 使用对象工厂获取实体类
+> * 使用反射对传入对象进行注入，即 age=21（这里的age是我们传入的instance，object是21）
+
+ 
+
+#### 4、wrapper的AOP增强
+
+* 这里的话介绍一下wrapper，怎么来的，在前面Dubbo SPI（二）中，loadClass方法会加载这个类：
+
+```java
+ else if (isWrapperClass(clazz)) { //如果是wrapper包装增强类
+        Set<Class<?>> wrappers = cachedWrapperClasses;//从缓存中获取所有class的set序列
+        if (wrappers == null) {//如果包装序列为空
+            //创建新的concurrentSet
+            cachedWrapperClasses = new ConcurrentHashSet<Class<?>>();
+            //获取包装集合
+            wrappers = cachedWrapperClasses;
+        }
+```
+
+* 先从缓存中获取要增强的方法，这个在Dubbo SPI源码（一）的时候，我们自己创建出来玩过。
+  * 这里就是从缓存中获取wrapper的集合，获取所有增强方法集合
+  * 遍历每一个方法，然后使用injectExtension，用set方法将我们要注入的类放入要增强的类中
+  * 返回这个实体类、
+
+如果看上面的三句不明白的话，可以结合Dubbo SPI源码（一）写的例子在多想想：
+
+```java
+			Set<Class<?>> wrapperClasses = cachedWrapperClasses;
+            if (wrapperClasses != null && !wrapperClasses.isEmpty()) {
+                // 循环获取Wrapper实例，wrapper类似于代理模式或者aop，会在输出语句前后执行事件
+                for (Class<?> wrapperClass : wrapperClasses) {
+                // 通过反射创建Wrapper实例
+                // 向Wrapper实例注入依赖，最后赋值给instance
+                // 自动包装实现类似aop功能
+                nstance = injectExtension((T) wrapperClass.getConstructor(type).newInstance(instance));
+                }
+            }
+				return instance;
+```
+
+### 整体流程
+
+![img](D:/学习资料/Middleware-study/dubbo-analysis/Dubbo SPI源码/5e9255d0a08a64f799820f15b99b374a.png)
+
+至此，Dubbo SPI全注释学习完毕，接下去得想想要学什么。如果有时间我还会继续学源码，直到我能平稳的造轮子为止。
 
 
 
-
-
-
+ 
