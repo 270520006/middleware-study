@@ -1,0 +1,68 @@
+# apollo的学习
+
+​	apollo类似于Nacos，都是注册中心的一种，但对于权限
+
+## 安装使用
+
+​	apollo的安装很麻烦，需要自身三个服务，并且还需要mysql支持，也就是一共需要四个服务，四个服务如下：
+
+>- mysql
+>- apollo-configservice
+>- apollo-adminsrevice
+>- apollo-portal
+
+### 配置mysql
+
+* 部署之前先将对应环境的Mysql服务启动起来，这里使用docker-compose启动Mysql服务，文件名为apollo-compose.yaml。
+
+```yml
+version: "3"
+services:
+ mysql-dev:
+  image: mysql
+  # restart: always
+  environment:
+   - MYSQL_ROOT_PASSWORD=123456
+  expose:
+   - "3306"
+  volumes:
+    - /home/apollo/apollo/scripts/sql:/sql     
+```
+
+*  mysql-portal启动并配置完成后开始启动apollo-portal服务：
+
+  ```shell
+   docker-compose -f apollo-compose.yaml up -d mysql-dev
+  ```
+
+apollo-compose.yaml是你机上docker-compose配置文件，mysql-dev是mysql服务的名称。
+
+* 进入mysql的docker容器内读取配置文件
+
+```shell
+#进入docker容器
+[root@localhost apollo]# docker exec -it 182e sh
+#进入容器的数据库中
+mysql -p123456
+#导入两个表信息
+#用于部署apollo-configservice和apollo-apolloportaldb
+source /sql/apolloconfigdb.sql
+#用于部署apollo-portal
+source /sql/apolloportaldb.sql
+```
+
+* 导入完毕后，需要对数据库进行修改
+
+```sql
+use ApolloConfigDB；
+update ServerConfig set Value="http://apollo-configservice-dev:8080/eureka/" where `key`="eureka.service.url";
+```
+
+apollo-configservice-dev是稍后我们需要发布的`apollo-configservice`服务的名称。修改完成之后可运行查询语句是否修改成功：
+
+```sql
+select * from ServerConfig;
+```
+
+修改完成之前退出dockre容器的连接就行了， 接下来部署`apollo-configservice`。
+
