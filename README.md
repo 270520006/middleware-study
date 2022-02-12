@@ -15,3 +15,7 @@
 3、完成了bean的生成源码
 
 4、为了学习dubbo SPI，事先学习了Java spi源码
+
+5、学习完了Nacos配置中心源码
+
+6、正在学习Apollo，等Apollo大概使用学习完，着手看源码
