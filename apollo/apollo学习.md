@@ -66,3 +66,57 @@ select * from ServerConfig;
 
 修改完成之前退出dockre容器的连接就行了， 接下来部署`apollo-configservice`。
 
+### 创建Config Service
+
+* 直接连上数据库即可
+
+```shell
+docker pull apolloconfig/apollo-configservice
+
+docker run -d \
+    --name apollo-configservice \
+    --net=host \
+    -v /tmp/logs:/opt/logs \
+    -e SPRING_DATASOURCE_URL="jdbc:mysql://8.129.217.148:3310/ApolloConfigDB?characterEncoding=utf8" \
+    -e SPRING_DATASOURCE_USERNAME=root \
+    -e SPRING_DATASOURCE_PASSWORD=123456 \
+    -p 8080:8081 \
+    -d \
+    apolloconfig/apollo-configservice
+
+```
+
+* 创建Admin Service
+
+```shell
+docker pull apolloconfig/apollo-adminservice
+
+docker run -d \
+    --name apollo-adminservice \
+    --net=host \
+    -v /tmp/logs:/opt/logs \
+    -e SPRING_DATASOURCE_URL="jdbc:mysql://8.129.217.148:3310/ApolloConfigDB?characterEncoding=utf8" \
+    -e SPRING_DATASOURCE_USERNAME=root \
+    -e SPRING_DATASOURCE_PASSWORD=123456 \
+    apolloconfig/apollo-adminservice
+```
+
+* 创建Portal Server
+
+```shell
+docker pull apolloconfig/apollo-portal
+
+docker run -d \
+    --name apollo-portal \
+    --net=host \
+    -v /tmp/logs:/opt/logs \
+    -e SPRING_DATASOURCE_URL="jdbc:mysql://8.129.217.148:3310/ApolloPortalDB?characterEncoding=utf8" \
+    -e SPRING_DATASOURCE_USERNAME=root \
+    -e SPRING_DATASOURCE_PASSWORD=123456 \
+    -e APOLLO_PORTAL_ENVS=dev \
+    -e DEV_META=http://192.168.56.101:8080 \
+    apolloconfig/apollo-portal
+```
+
+至此，apollo搭建完成
+
