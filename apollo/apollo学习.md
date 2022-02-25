@@ -118,5 +118,13 @@ docker run -d \
     apolloconfig/apollo-portal
 ```
 
-至此，apollo搭建完成
+至此，apollo搭建完成。
+
+* 测试一下，访问8070端口，可以出现apollo页面即可。
+
+```
+http://192.168.56.101:8070/
+```
+
+![image-20220225101808933](apollo学习/image-20220225101808933.png)
 
