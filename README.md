@@ -19,3 +19,5 @@
 5、学习完了Nacos配置中心源码
 
 6、正在学习Apollo，等Apollo大概使用学习完，着手看源码
+
+7、对freemarker源码进行了查看
