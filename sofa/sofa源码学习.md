@@ -22,7 +22,7 @@ public class HelloSyncServiceImpl implements HelloSyncService {
 }
 ```
 
-* 建立客户端
+* 建立服务端
 
 ```java
 public class QuickStartServer {
@@ -42,7 +42,7 @@ public class QuickStartServer {
 }
 ```
 
-* 建立服务端
+* 建立客户端
 
 ```java
 public class QuickStartClient {
@@ -214,5 +214,352 @@ public class QuickStartClient {
             return proxyIns;
         }
     }
+```
+
+总结：
+
+>这个方法里面除了做校验以外，主要做了如下几件事:
+>
+>* 设置cluster属性，默认是FailOverCluster
+>* 设置监听器
+>* 初始化cluster
+>  * 构造路由链表，主要有DirectUrlRouter、RegistryRouter、CustomRouter
+>  * 设置loadBalancer属性，默认是RandomLoadBalancer
+>  * 设置地址管理器addressHolder
+>  * 设置连接管理器connectionHolder
+>  * 构造Filter链
+>  * 启动重连线程
+>* 设置proxylnvoker属性，如果用的是bolt协议，那么返回的是BoltClientProxylnvoker
+>* 创建代理类
+
+​	这里还有些细节没理清楚，不过大体步骤已经清晰，等服务暴露源码看完以后，再回来把这部分细节剖析。
+
+## 服务暴露源码
+
+从服务端进入服务暴露的入口：
+
+```java
+        providerConfig.export(); // 发布服务
+```
+
+* 进入export方法后：判断是否有生产者启动类
+  * 有，则进行暴露
+  * 没有，创造启动类（因为这块和先前的服务调用源码一样，所以这里就不再赘述）
+
+```java
+    public synchronized void export() {
+        if (providerBootstrap == null) {
+       	//判断先前有没有创建过服务生产者启动类，没有就创建一个新的
+            providerBootstrap = Bootstraps.from(this);
+        }
+        providerBootstrap.export();
+    }
+```
+
+* 继续跟进export源码
+
+![image-20220321152928604](sofa源码学习/image-20220321152928604.png)
+
+* 进入export源码：是否设置了延时加载
+  * 是，使用延时加载线程工厂起一个线程，延时暴露
+  * 否，设置则直接暴露
+
+```java
+    @Override
+    public void export() {
+        if (providerConfig.getDelay() > 0) { // 延迟加载,单位毫秒
+            Thread thread = factory.newThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        Thread.sleep(providerConfig.getDelay());
+                    } catch (Throwable ignore) { // NOPMD
+                    }
+                    doExport();
+                }
+            });
+            thread.start();
+        } else {
+            doExport();
+        }
+    }
+```
+
+* 进入doExport方法中：下面介绍下参数
+  * exported：为true则说明服务发布过，保证不重复发布
+  * key：获取唯一标识，由interfaceId + ":" + uniqueId 组成
+  * appName：发布的应用名
+  * maxProxyCount：最大发布数
+
+```java
+    private void doExport() {
+        if (exported) {
+            return;
+        }
+        //获取唯一标识，interfaceId + ":" + uniqueId;
+        String key = providerConfig.buildKey();
+        //获取应用名称
+        String appName = providerConfig.getAppName();
+        // 检查参数
+        checkParameters();
+        if (LOGGER.isInfoEnabled(appName)) {
+            LOGGER.infoWithApp(appName, "Export provider config : {} with bean id {}", key, providerConfig.getId());
+        }
+        // 注意同一interface，同一uniqleId，不同server情况
+        AtomicInteger cnt = EXPORTED_KEYS.get(key); // 计数器
+        if (cnt == null) { // 没有发布过，就把该实例放到缓存中
+            cnt = CommonUtils.putToConcurrentMap(EXPORTED_KEYS, key, new AtomicInteger(0));
+        }
+        int c = cnt.incrementAndGet(); //要使用前自增1
+        int maxProxyCount = providerConfig.getRepeatedExportLimit();//获取最大发布数
+        if (maxProxyCount > 0) {
+            if (c > maxProxyCount) {
+                //自减少1
+                cnt.decrementAndGet();
+                // 超过最大数量，直接抛出异常
+                throw new SofaRpcRuntimeException("Duplicate provider config with key " + key
+                    + " has been exported more than " + maxProxyCount + " times!"
+                    + " Maybe it's wrong config, please check it."
+                    + " Ignore this if you did that on purpose!");
+            } else if (c > 1) {
+                if (LOGGER.isInfoEnabled(appName)) {
+                    LOGGER.infoWithApp(appName, "Duplicate provider config with key {} has been exported!"
+                        + " Maybe it's wrong config, please check it."
+                        + " Ignore this if you did that on purpose!", key);
+                }
+            }
+        }
+
+        try {
+            // 构造请求调用器（后面细说）
+            providerProxyInvoker = new ProviderProxyInvoker(providerConfig);
+            // 初始化注册中心
+            if (providerConfig.isRegister()) {
+                List<RegistryConfig> registryConfigs = providerConfig.getRegistry();
+                if (CommonUtils.isNotEmpty(registryConfigs)) {
+                    for (RegistryConfig registryConfig : registryConfigs) {
+                        RegistryFactory.getRegistry(registryConfig); // 提前初始化Registry
+                    }
+                }
+            }
+            // 将处理器注册到server
+            List<ServerConfig> serverConfigs = providerConfig.getServer();
+            for (ServerConfig serverConfig : serverConfigs) {
+                try {
+                    Server server = serverConfig.buildIfAbsent();
+                    // 注册序列化接口
+                    server.registerProcessor(providerConfig, providerProxyInvoker);
+                    if (serverConfig.isAutoStart()) {
+                        server.start();
+                    }
+                } catch (SofaRpcRuntimeException e) {
+                    throw e;
+                } catch (Exception e) {
+                    LOGGER.errorWithApp(appName, "Catch exception when register processor to server: "
+                        + serverConfig.getId(), e);
+                }
+            }
+            // 注册到注册中心
+            providerConfig.setConfigListener(new ProviderAttributeListener());
+            register();
+        } catch (Exception e) {
+            cnt.decrementAndGet();
+            if (e instanceof SofaRpcRuntimeException) {
+                throw (SofaRpcRuntimeException) e;
+            } else {
+                throw new SofaRpcRuntimeException("Build provider proxy error!", e);
+            }
+        }
+
+        // 记录一些缓存数据
+        RpcRuntimeContext.cacheProviderConfig(this);
+        exported = true;
+    }
+
+```
+
+总结：
+
+>* 1.检查参数是否正确
+>  * 检查注入的对象是否是接口的实现类
+>  * providerConfig是否有设置server参数
+>  * 检查方法，是否有重名的方法，对方法进行黑白名单的过滤(对配置的include和exclude方法进行过滤)
+>* 2.遍历设置的serverConfigs
+>* 3.对要发布的接口进行计数，如果超过了设置的repeatedExportLimit那么就抛出异常
+>* 4.构造请求调用器
+>* 5.初始化注册中心
+>* 6.注册请求调用器
+>* 7.启动服务
+>* 8.设置监听
+>* 9.注册到注册中心
+
+​	服务请求调用器，后续跟着架构图来讲，先继续跟进注册方法register。
+
+* 进入register进行查看：
+
+```java
+    protected void register() {
+        //判断是否注册，如果为false则是订阅
+        if (providerConfig.isRegister()) {
+            //从配置类中获取配置中心，可以有多个
+            List<RegistryConfig> registryConfigs = providerConfig.getRegistry();
+            if (registryConfigs != null) {
+                for (RegistryConfig registryConfig : registryConfigs) {
+                    //得到注册中心对象
+                    Registry registry = RegistryFactory.getRegistry(registryConfig);
+                    registry.init(); //初始化注册中心对象（心跳管理）
+                    registry.start(); //启动注册中心对象
+                    try {
+                        //将其注册到注册中心
+                        registry.register(providerConfig);
+                    } catch (SofaRpcRuntimeException e) {
+                        throw e;
+                    } catch (Throwable e) {
+                        String appName = providerConfig.getAppName();
+                        if (LOGGER.isWarnEnabled(appName)) {
+                            LOGGER.warnWithApp(appName, "Catch exception when register to registry: "
+                                + registryConfig.getId(), e);
+                        }
+                    }
+                }
+            }
+        }
+    }
+```
+
+​	这里有很多点可以讲，比如心跳管理，是由init初始化实现的，实现的注册中心有以下几种：通过RegistryFactory获取
+
+>SOFARegistry
+>Zookeeper
+>本地文件
+>Consul
+>Nacos
+
+## 负载均衡源码(dubbo和sofa)
+
+​	集群状态下，多台机子调用sofa rpc，需要一个负载均衡对其调用进行分发，下面讲一下负载均衡这块的源码。
+
+​	首先找到doSelect这个方法，这里包含了5个实现类，分别是：
+
+>* 一致性hash算法：同样的请求（第一参数）会打到同样的节点
+>* 本机优先的随机算法:顾名思义，有本地请求优先分发到本地服务中
+>* 负载均衡随机算法：全部列表按权重随机选择
+>* 按权重的负载均衡轮询算法，按方法级进行轮询，性能较差，不推荐 例如：权重为1、2、3、4三个节点，顺序为 1234234344
+
+![image-20220329205014037](sofa源码学习/image-20220329205014037.png)
+
+因为看过dubbo的负载均衡源码，这里索性把sofa rpc源码和dubbo的负载均衡源码，拿出来对比。
+
+### 随机算法
+
+* 先获取所有权重，总权重
+* 比较所有权重是否相等
+  * 相同，直接用服务数量随机使用
+  * 不相同，随机总权重，获取到这个数，遍历减去每个服务的权重，为负则说明在这个服务片段上，返回该服务。
+
+```java
+	private final Random random = new Random();
+    @Override
+    public ProviderInfo doSelect(SofaRequest invocation, List<ProviderInfo> providerInfos) {
+        ProviderInfo providerInfo = null;
+        int size = providerInfos.size(); // 总个数
+        int totalWeight = 0; // 总权重
+        boolean isWeightSame = true; // 权重是否都一样
+        for (int i = 0; i < size; i++) {
+            int weight = getWeight(providerInfos.get(i));
+            totalWeight += weight; // 累计总权重
+            //isWeightSame初始为true，恒成立。i判定最少有2个服务，当前服务和上一个服务的权重一样
+            if (isWeightSame && i > 0 && weight != getWeight(providerInfos.get(i - 1))) {
+                isWeightSame = false; // 计算所有权重是否一样
+            }
+        }
+        if (totalWeight > 0 && !isWeightSame) {
+            // 如果权重不相同且权重大于0则按总权重数随机
+            int offset = random.nextInt(totalWeight);
+            // 并确定随机值落在哪个片断上
+            for (int i = 0; i < size; i++) {
+                offset -= getWeight(providerInfos.get(i));
+                if (offset < 0) {
+                    providerInfo = providerInfos.get(i);
+                    break;
+                }
+            }
+        } else {
+            // 如果权重相同或权重为0则均等随机
+            providerInfo = providerInfos.get(random.nextInt(size));
+        }
+        return providerInfo;
+    }
+```
+
+看一下dubbo怎么实现的：
+
+* 获取服务数量，第一个服务的权重，总权重
+* 比较权重是否相同
+  * 相同，随机调用一个服务
+  * 不相同，查看权重落在哪个片段上
+
+```java
+@Override
+protected <T> Invoker<T> doSelect(List<Invoker<T>> invokers, URL url, Invocation invocation) {
+    int length = invokers.size(); // Number of invokers
+    boolean sameWeight = true; // Every invoker has the same weight?
+    int firstWeight = getWeight(invokers.get(0), invocation);
+    int totalWeight = firstWeight; // The sum of weights
+    for (int i = 1; i < length; i++) {
+        int weight = getWeight(invokers.get(i), invocation);
+        totalWeight += weight; // Sum
+        if (sameWeight && weight != firstWeight) {
+            sameWeight = false;
+        }
+    }
+    if (totalWeight > 0 && !sameWeight) {
+        // If (not every invoker has the same weight & at least one invoker's weight>0), select randomly based on totalWeight.
+        int offset = ThreadLocalRandom.current().nextInt(totalWeight);
+        // Return a invoker based on the random value.
+        for (int i = 0; i < length; i++) {
+            offset -= getWeight(invokers.get(i), invocation);
+            if (offset < 0) {
+                return invokers.get(i);
+            }
+        }
+    }
+    // If all invokers have the same weight value or totalWeight=0, return evenly.
+    return invokers.get(ThreadLocalRandom.current().nextInt(length));
+}
+```
+
+通过上面的分析可以看出，就随机算法而言，二者的负载均衡机制是一样的。
+
+### 本地优先算法
+
+​	在负载均衡时使用保持本机优先。这个也比较好理解。在所有的可选地址中，找到本机发布的地址，然后进行调用。这个只有sofa有，看sofa怎么实现的就好：
+
+* 先获取缓存中的ip地址
+* 遍历比较ip地址和服务集合的ip是否一致
+  * 一致，加入本地集合中
+  * 不一致，什么都不做
+* 先去对本地服务使用随机算法调用服务，如果本地服务都被调用完了或没有了，就使用非本地服务（随机算法）
+
+```java
+@Override
+public ProviderInfo doSelect(SofaRequest invocation, List<ProviderInfo> providerInfos) {
+    String localhost = SystemInfo.getLocalHost();
+    if (StringUtils.isEmpty(localhost)) {
+        //全部为空就使用 随机算法
+        return super.doSelect(invocation, providerInfos);
+    }
+    List<ProviderInfo> localProviderInfo = new ArrayList<ProviderInfo>();
+    for (ProviderInfo providerInfo : providerInfos) { // 解析IP，看是否和本地一致
+        if (localhost.equals(providerInfo.getHost())) {
+            localProviderInfo.add(providerInfo);
+        }
+    }
+    if (CommonUtils.isNotEmpty(localProviderInfo)) { // 命中本机的服务端
+        return super.doSelect(invocation, localProviderInfo);
+    } else { // 没有命中本机上的服务端
+        return super.doSelect(invocation, providerInfos);
+    }
+}
 ```
 
