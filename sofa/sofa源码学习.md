@@ -563,3 +563,121 @@ public ProviderInfo doSelect(SofaRequest invocation, List<ProviderInfo> provider
 }
 ```
 
+### 轮询算法
+
+​	先看一下sofa是怎么实现的：
+
+* 从请求获取需要使用的服务，从列表里获取使用的服务列表数量
+* 将服务的key和服务调用次数放入map
+* 取出对应服务调用次数自增一次，除服务列表数量，得到要调用的具体服务，返回调用。
+
+```java
+private final ConcurrentMap<String, PositiveAtomicCounter> sequences = new ConcurrentHashMap<String, PositiveAtomicCounter>();
+
+@Override
+public ProviderInfo doSelect(SofaRequest request, List<ProviderInfo> providerInfos) {
+    String key = getServiceKey(request); // 每个方法级自己轮询，互不影响
+    int length = providerInfos.size(); // 总个数
+    PositiveAtomicCounter sequence = sequences.get(key);
+    if (sequence == null) {
+        sequences.putIfAbsent(key, new PositiveAtomicCounter());
+        sequence = sequences.get(key);
+    }
+    return providerInfos.get(sequence.getAndIncrement() % length);
+}
+
+private String getServiceKey(SofaRequest request) {
+    StringBuilder builder = new StringBuilder();
+    builder.append(request.getTargetAppName()).append("#")
+        .append(request.getMethodName());
+    return builder.toString();
+}
+```
+
+### 权重负载均衡轮询算法
+
+​	dubbo实现轮询的方法因为涉及权重则较为麻烦，下面举例说明下。sofa也有一个权重轮询，不过由于性能太差就被弃置了。
+
+这里算法比较麻烦需要记录几个点：
+
+* 首先每个服务都有一个初始权重，当前权重。公共区域有一个初始分段起始位置。
+* 当需要调用服务的时候，优先获取总权重：
+  * 第一次调用，服务会调用最后一个，因为总权重减去前两个正好在第三个。而后，当前权重=当前权重-总权重
+  * 所有服务进行一次累加，当前权重=当前权重+权重
+  * 第二次调用，从初始位置开始，落点位置=总权重-所有服务当前权重，找到调用服务位置。而后，当前权重=当前权重-总权重
+  * 所有服务进行一次累加，当前权重=当前权重+权重
+  * 就这样的循环一直往复
+
+```java
+假定有3台dubbo provider:
+
+10.0.0.1:20884, weight=2
+10.0.0.1:20886, weight=3
+10.0.0.1:20888, weight=4
+
+totalWeight=9;
+
+那么第一次调用的时候：
+10.0.0.1:20884, weight=2    selectedWRR -> current = 2
+10.0.0.1:20886, weight=3    selectedWRR -> current = 3
+10.0.0.1:20888, weight=4    selectedWRR -> current = 4
+ 
+selectedInvoker-> 10.0.0.1:20888 
+调用 selectedWRR.sel(totalWeight); 
+10.0.0.1:20888, weight=4    selectedWRR -> current = -5
+返回10.0.0.1:20888这个实例
+
+那么第二次调用的时候：
+10.0.0.1:20884, weight=2    selectedWRR -> current = 4
+10.0.0.1:20886, weight=3    selectedWRR -> current = 6
+10.0.0.1:20888, weight=4    selectedWRR -> current = -1
+
+selectedInvoker-> 10.0.0.1:20886 
+调用 selectedWRR.sel(totalWeight); 
+10.0.0.1:20886 , weight=4   selectedWRR -> current = -3
+返回10.0.0.1:20886这个实例
+
+那么第三次调用的时候：
+10.0.0.1:20884, weight=2    selectedWRR -> current = 6
+10.0.0.1:20886, weight=3    selectedWRR -> current = 0
+10.0.0.1:20888, weight=4    selectedWRR -> current = 3
+
+selectedInvoker-> 10.0.0.1:20884
+调用 selectedWRR.sel(totalWeight); 
+10.0.0.1:20884, weight=2    selectedWRR -> current = -3
+返回10.0.0.1:20884这个实例
+```
+
+### 一致性hash算法
+
+​	在SOFARPC中有两种方式实现一致性hash算法，一种是带权重的一种是不带权重的，我对比了一下，两边的代码基本上是一样的，所以我直接分析带权重的代码就好了。
+
+* 首先获取接口id和方法名的哈希，比较原缓存是否存在
+  * 提一嘴，Selector主要存储一个treemap，key为服务的哈希，value为服务
+* 如果选择器存在，且不为空，丢给选择器处理，最终提供服务
+* 选择器哈希不匹配或为空，则重新造一个选择器，放到缓存里，依旧丢给选择器处理，最终提供服务。
+
+```java
+       private ConcurrentHashMap<String, Selector> selectorCache = new ConcurrentHashMap<String, Selector>();
+	@Override
+    public ProviderInfo doSelect(SofaRequest request, List<ProviderInfo> providerInfos) {
+        String interfaceId = request.getInterfaceName();
+        String method = request.getMethodName();
+        String key = interfaceId + "#" + method;
+        int hashcode = providerInfos.hashCode(); // 判断是否同样的服务列表
+        Selector selector = selectorCache.get(key);
+        if (selector == null // 原来没有
+            ||
+            selector.getHashCode() != hashcode) { // 或者服务列表已经变化
+            selector = new Selector(interfaceId, method, providerInfos, hashcode);
+            selectorCache.put(key, selector);
+        }
+        return selector.select(request);
+    }
+
+```
+
+
+
+
+
